@@ -1,11 +1,10 @@
 #include "priority_queue.h"
-#include "memcheck.h"
 
 #include <stdlib.h>
 
 PQNode *pq_enqueue(PQNode **a_head, void *a_value, int (*cmp_fn)(const void *, const void *))
 {
-    PQNode *new_node = my_malloc(sizeof(PQNode));
+    PQNode *new_node = malloc(sizeof(PQNode));
     new_node->a_value = a_value;
     new_node->next = NULL;
 
@@ -45,7 +44,7 @@ PQNode *stack_pop(PQNode **stack) {
 void destroy_list(PQNode **a_head) {
     while (*a_head != NULL) {
         PQNode *node = pq_dequeue(a_head);
-        my_free(node->a_value);
-        my_free(node);
+        free(node->a_value);
+        free(node);
     }
 }

@@ -1,5 +1,4 @@
 #include "huffman.h"
-#include "memcheck.h"
 
 bool calc_frequencies(Frequencies freqs, const char *path, const char **a_error) {
     FILE *file = fopen(path, "rb");
@@ -26,17 +25,21 @@ static int huffman_cmp(const void *a, const void *b) {
     return (int)node_a->character - (int)node_b->character;
 }
 
+static TreeNode *new_node(uchar character, size_t frequency, TreeNode *left, TreeNode *right) {
+    TreeNode *node = malloc(sizeof(TreeNode));
+    node->character = character;
+    node->frequency = frequency;
+    node->left = left;
+    node->right = right;
+    return node;
+}
+
 TreeNode *make_huffman_tree(Frequencies freq) {
     PQNode *pq = NULL;
     for (int i = 0; i < 256; i++) {
-        if (freq[i] == 0) continue;
-
-        TreeNode *leaf = my_malloc(sizeof(TreeNode));
-        leaf->character = (uchar)i;
-        leaf->frequency = freq[i];
-        leaf->left = NULL;
-        leaf->right = NULL;
-        pq_enqueue(&pq, leaf, huffman_cmp);
+        if (freq[i] > 0) {
+            pq_enqueue(&pq, new_node((uchar)i, freq[i], NULL, NULL), huffman_cmp);
+        }
     }
 
     if (pq == NULL) return NULL;
@@ -47,20 +50,16 @@ TreeNode *make_huffman_tree(Frequencies freq) {
         PQNode *node2 = pq_dequeue(&pq);
         TreeNode *left = node1->a_value;
         TreeNode *right = node2->a_value;
-        my_free(node1);
-        my_free(node2);
+        free(node1);
+        free(node2);
 
-        TreeNode *merge = my_malloc(sizeof(TreeNode));
-        merge->character = '\0';
-        merge->frequency = left->frequency + right->frequency;
-        merge->left = left;
-        merge->right = right;
-        pq_enqueue(&pq, merge, huffman_cmp);
+        pq_enqueue(&pq, new_node('\0', left->frequency + right->frequency, left, right),
+                   huffman_cmp);
     }
 
     PQNode *pq_root = pq_dequeue(&pq);
     TreeNode *root = pq_root->a_value;
-    my_free(pq_root);
+    free(pq_root);
     return root;
 }
 
@@ -71,15 +70,18 @@ void destroy_huffman_tree(TreeNode **a_root) {
     destroy_huffman_tree(&root->left);
     destroy_huffman_tree(&root->right);
 
-    my_free(root);
+    free(root);
     *a_root = NULL;
 }
 
-// Post-order: leaves emit 1 followed by their byte, interior nodes emit 0.
+static bool is_leaf(const TreeNode *node) {
+    return node->left == NULL && node->right == NULL;
+}
+
 void write_coding_table(TreeNode *root, BitWriter *a_writer) {
     if (root == NULL) return;
 
-    if (root->left == NULL && root->right == NULL) {
+    if (is_leaf(root)) {
         write_bits(a_writer, 1, 1);
         write_bits(a_writer, root->character, 8);
     }
@@ -90,16 +92,76 @@ void write_coding_table(TreeNode *root, BitWriter *a_writer) {
     }
 }
 
+// Frees a stack of partially built subtrees left behind by a failed read.
+static void destroy_node_stack(PQNode **a_stack) {
+    while (*a_stack != NULL) {
+        PQNode *node = stack_pop(a_stack);
+        TreeNode *subtree = node->a_value;
+        destroy_huffman_tree(&subtree);
+        free(node);
+    }
+}
+
+TreeNode *read_coding_table(BitReader *a_reader, uint16_t nsymbols) {
+    if (nsymbols == 0) return NULL;
+
+    // The table is post-order, so it replays as a stack machine: leaves are
+    // pushed, and a 0 pops the two subtrees it joins. It is complete once every
+    // declared leaf has been seen and the stack has collapsed to a single root.
+    PQNode *stack = NULL;
+    uint16_t leaves = 0;
+    while (leaves < nsymbols || stack == NULL || stack->next != NULL) {
+        uint8_t bit;
+        if (!read_bits(a_reader, 1, &bit)) goto fail;
+
+        if (bit == 1) {
+            uint8_t character;
+            if (leaves == nsymbols) goto fail;
+            if (!read_bits(a_reader, 8, &character)) goto fail;
+            stack_push(&stack, new_node(character, 0, NULL, NULL));
+            leaves++;
+        }
+        else {
+            // The right subtree was written second, so it pops first.
+            PQNode *right = stack_pop(&stack);
+            PQNode *left = stack_pop(&stack);
+            if (right == NULL || left == NULL) {
+                free(right);
+                free(left);
+                goto fail;
+            }
+            stack_push(&stack, new_node('\0', 0, left->a_value, right->a_value));
+            free(right);
+            free(left);
+        }
+    }
+
+    PQNode *top = stack_pop(&stack);
+    TreeNode *root = top->a_value;
+    free(top);
+    return root;
+
+fail:
+    destroy_node_stack(&stack);
+    return NULL;
+}
+
 // One bit per element; a code is at most 255 bits long.
 static uint8_t code_bits[256][256];
 static int code_len[256];
 
 static void build_codes(TreeNode *root, uint8_t *path, int depth) {
-    if (root->left == NULL && root->right == NULL) {
+    if (is_leaf(root)) {
         uchar c = root->character;
-        memcpy(code_bits[c], path, depth);
-        // A tree with a single leaf still needs a one-bit code for it.
-        code_len[c] = depth > 0 ? depth : 1;
+        if (depth == 0) {
+            // A tree of one leaf still needs a code, so give it a single 0 bit.
+            code_bits[c][0] = 0;
+            code_len[c] = 1;
+        }
+        else {
+            memcpy(code_bits[c], path, depth);
+            code_len[c] = depth;
+        }
         return;
     }
 
@@ -109,26 +171,200 @@ static void build_codes(TreeNode *root, uint8_t *path, int depth) {
     build_codes(root->right, path, depth + 1);
 }
 
-void write_compressed(BitWriter *a_writer, uint8_t *uncompressed_bytes, TreeNode *root) {
+void write_compressed(BitWriter *a_writer, const uint8_t *uncompressed_bytes, uint64_t len,
+                      TreeNode *root) {
     if (root == NULL) return;
 
     uint8_t path[256];
     memset(code_len, 0, sizeof(code_len));
     build_codes(root, path, 0);
 
-    for (int i = 0; uncompressed_bytes[i] != '\0'; i++) {
-        uint8_t *bits = code_bits[uncompressed_bytes[i]];
-        int len = code_len[uncompressed_bytes[i]];
+    for (uint64_t i = 0; i < len; i++) {
+        const uint8_t *bits = code_bits[uncompressed_bytes[i]];
+        int code = code_len[uncompressed_bytes[i]];
 
         // write_bits takes at most 8 bits at a time.
-        for (int written = 0; written < len; ) {
-            int chunk = len - written > 8 ? 8 : len - written;
+        for (int written = 0; written < code; ) {
+            int chunk = code - written > 8 ? 8 : code - written;
             uint8_t byte = 0;
             for (int j = 0; j < chunk; j++) {
-                byte = (byte << 1) | bits[written + j];
+                byte = (uint8_t)((byte << 1) | bits[written + j]);
             }
-            write_bits(a_writer, byte, chunk);
+            write_bits(a_writer, byte, (uint8_t)chunk);
             written += chunk;
         }
     }
+}
+
+bool read_compressed(BitReader *a_reader, FILE *file, TreeNode *root, uint64_t len) {
+    if (root == NULL) return len == 0;
+
+    for (uint64_t i = 0; i < len; i++) {
+        TreeNode *node = root;
+        while (!is_leaf(node)) {
+            uint8_t bit;
+            if (!read_bits(a_reader, 1, &bit)) return false;
+            node = bit ? node->right : node->left;
+            if (node == NULL) return false;
+        }
+
+        // A one-leaf tree encodes each byte as a single bit that carries no
+        // information, so consume it here rather than walking for it above.
+        if (node == root) {
+            uint8_t bit;
+            if (!read_bits(a_reader, 1, &bit)) return false;
+        }
+
+        fputc(node->character, file);
+    }
+    return true;
+}
+
+static void write_be(FILE *file, uint64_t value, int nbytes) {
+    for (int i = nbytes - 1; i >= 0; i--) {
+        fputc((int)((value >> (i * 8)) & 0xff), file);
+    }
+}
+
+static bool read_be(FILE *file, uint64_t *a_value, int nbytes) {
+    uint64_t value = 0;
+    for (int i = 0; i < nbytes; i++) {
+        int c = fgetc(file);
+        if (c == EOF) return false;
+        value = (value << 8) | (uint64_t)c;
+    }
+    *a_value = value;
+    return true;
+}
+
+// Reads the whole file into a fresh buffer of `len` bytes.
+static uint8_t *read_file(const char *path, uint64_t len, const char **a_error) {
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        *a_error = strerror(errno);
+        return NULL;
+    }
+
+    uint8_t *bytes = malloc(len);
+    if (bytes == NULL || fread(bytes, 1, len, file) != len) {
+        *a_error = bytes == NULL ? "out of memory" : "input file changed while reading";
+        free(bytes);
+        fclose(file);
+        return NULL;
+    }
+
+    fclose(file);
+    return bytes;
+}
+
+bool huffman_compress(const char *in_path, const char *out_path, const char **a_error) {
+    Frequencies freqs = {0};
+    if (!calc_frequencies(freqs, in_path, a_error)) return false;
+
+    uint64_t length = 0;
+    uint16_t nsymbols = 0;
+    for (int i = 0; i < 256; i++) {
+        if (freqs[i] > 0) {
+            length += freqs[i];
+            nsymbols++;
+        }
+    }
+
+    uint8_t *bytes = NULL;
+    if (length > 0) {
+        bytes = read_file(in_path, length, a_error);
+        if (bytes == NULL) return false;
+    }
+
+    FILE *out = fopen(out_path, "wb");
+    if (out == NULL) {
+        *a_error = strerror(errno);
+        free(bytes);
+        return false;
+    }
+
+    fwrite(HUFFMAN_MAGIC, 1, HUFFMAN_MAGIC_LEN, out);
+    fputc(HUFFMAN_VERSION, out);
+    write_be(out, nsymbols, 2);
+    write_be(out, length, 8);
+
+    TreeNode *root = make_huffman_tree(freqs);
+    if (root != NULL) {
+        BitWriter writer;
+        bit_writer_init(&writer, out);
+        write_coding_table(root, &writer);
+        write_compressed(&writer, bytes, length, root);
+        bit_writer_flush(&writer);
+        destroy_huffman_tree(&root);
+    }
+
+    free(bytes);
+
+    if (fclose(out) != 0) {
+        *a_error = strerror(errno);
+        return false;
+    }
+    return true;
+}
+
+bool huffman_decompress(const char *in_path, const char *out_path, const char **a_error) {
+    FILE *in = fopen(in_path, "rb");
+    if (in == NULL) {
+        *a_error = strerror(errno);
+        return false;
+    }
+
+    char magic[HUFFMAN_MAGIC_LEN];
+    uint64_t version, nsymbols, length;
+    if (fread(magic, 1, sizeof(magic), in) != sizeof(magic) ||
+        memcmp(magic, HUFFMAN_MAGIC, sizeof(magic)) != 0) {
+        *a_error = "not a huffman file";
+        fclose(in);
+        return false;
+    }
+    if (!read_be(in, &version, 1) || !read_be(in, &nsymbols, 2) || !read_be(in, &length, 8)) {
+        *a_error = "truncated header";
+        fclose(in);
+        return false;
+    }
+    if (version != HUFFMAN_VERSION) {
+        *a_error = "unsupported format version";
+        fclose(in);
+        return false;
+    }
+
+    FILE *out = fopen(out_path, "wb");
+    if (out == NULL) {
+        *a_error = strerror(errno);
+        fclose(in);
+        return false;
+    }
+
+    bool ok = true;
+    if (nsymbols > 0) {
+        BitReader reader;
+        bit_reader_init(&reader, in);
+
+        TreeNode *root = read_coding_table(&reader, (uint16_t)nsymbols);
+        if (root == NULL) {
+            *a_error = "corrupt coding table";
+            ok = false;
+        }
+        else {
+            ok = read_compressed(&reader, out, root, length);
+            if (!ok) *a_error = "truncated compressed data";
+            destroy_huffman_tree(&root);
+        }
+    }
+    else if (length != 0) {
+        *a_error = "header declares data but no symbols";
+        ok = false;
+    }
+
+    fclose(in);
+    if (fclose(out) != 0 && ok) {
+        *a_error = strerror(errno);
+        ok = false;
+    }
+    return ok;
 }

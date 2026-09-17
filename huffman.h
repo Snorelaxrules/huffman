@@ -1,6 +1,7 @@
 #ifndef HUFFMAN_H
 #define HUFFMAN_H
 
+#include "bitwriter.h"
 #include "priority_queue.h"
 
 #include <errno.h>
@@ -14,15 +15,24 @@
 typedef unsigned char uchar;
 
 /**
- * Bit-level output stream. Declared here rather than included; the definition
- * lives with the implementation.
+ * Compressed file layout. The header is byte-aligned and written first; the
+ * coding table and the compressed data follow as one continuous bit stream.
+ *
+ *   offset  size  field
+ *        0     4  magic "HUFF"
+ *        4     1  format version
+ *        5     2  number of distinct symbols, big-endian (0 for an empty file)
+ *        7     8  original length in bytes, big-endian
+ *       15     -  coding table, then compressed data, zero-padded to a byte
+ *
+ * Storing the original length is what lets the reader stop exactly at the end
+ * of the data and ignore the padding bits in the final byte.
  */
-typedef struct _BitWriter BitWriter;
+#define HUFFMAN_MAGIC "HUFF"
+#define HUFFMAN_MAGIC_LEN 4
+#define HUFFMAN_VERSION 1
+#define HUFFMAN_HEADER_LEN 15
 
-/** @brief Write the low `nbits` bits of `bits` to `a_writer`. */
-void write_bits(BitWriter *a_writer, uint8_t bits, uint8_t nbits);
-
-/** Character frequencies, indexed by byte value. */
 typedef uint64_t Frequencies[256];
 
 /**
@@ -57,13 +67,46 @@ void destroy_huffman_tree(TreeNode **a_root);
 
 /**
  * @brief Write the coding table encoded by `root` to `a_writer`.
+ *
+ * Post-order: a leaf emits 1 then its 8-bit character, an interior node emits
+ * its two subtrees then 0.
  */
 void write_coding_table(TreeNode *root, BitWriter *a_writer);
 
 /**
- * @brief Compress the NUL-terminated `uncompressed_bytes` using `root` and
- * write the resulting bits to `a_writer`.
+ * @brief Rebuild the tree written by write_coding_table(...).
+ *
+ * @param nsymbols the leaf count recorded in the header, which is what tells
+ * this function where the table ends
+ * @return the root, or NULL if the table is malformed or truncated
  */
-void write_compressed(BitWriter *a_writer, uint8_t *uncompressed_bytes, TreeNode *root);
+TreeNode *read_coding_table(BitReader *a_reader, uint16_t nsymbols);
+
+/**
+ * @brief Compress `len` bytes of `uncompressed_bytes` using `root`.
+ */
+void write_compressed(BitWriter *a_writer, const uint8_t *uncompressed_bytes, uint64_t len,
+                      TreeNode *root);
+
+/**
+ * @brief Decode exactly `len` bytes from `a_reader` using `root` into `file`.
+ *
+ * @return false if the bit stream ran out or led somewhere invalid
+ */
+bool read_compressed(BitReader *a_reader, FILE *file, TreeNode *root, uint64_t len);
+
+/**
+ * @brief Compress `in_path` to `out_path`.
+ *
+ * @param a_error set to a message if the operation fails
+ */
+bool huffman_compress(const char *in_path, const char *out_path, const char **a_error);
+
+/**
+ * @brief Decompress `in_path` to `out_path`, reversing huffman_compress(...).
+ *
+ * @param a_error set to a message if the operation fails
+ */
+bool huffman_decompress(const char *in_path, const char *out_path, const char **a_error);
 
 #endif // HUFFMAN_H
