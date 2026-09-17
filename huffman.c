@@ -146,52 +146,58 @@ fail:
     return NULL;
 }
 
-// One bit per element; a code is at most 255 bits long.
-static uint8_t code_bits[256][256];
-static int code_len[256];
+// Sets or clears the bit at `index` in a packed MSB-first bit string.
+static void set_bit(uint8_t *code, int index, int value) {
+    uint8_t mask = (uint8_t)(1 << (7 - (index & 7)));
+    if (value) code[index >> 3] |= mask;
+    else code[index >> 3] &= (uint8_t)~mask;
+}
 
-static void build_codes(TreeNode *root, uint8_t *path, int depth) {
-    if (is_leaf(root)) {
-        uchar c = root->character;
+static int get_bit(const uint8_t *code, int index) {
+    return (code[index >> 3] >> (7 - (index & 7))) & 1;
+}
+
+static void build_codes(TreeNode *node, CodeTable *a_table, uint8_t *code, int depth) {
+    if (is_leaf(node)) {
+        uchar c = node->character;
         if (depth == 0) {
             // A tree of one leaf still needs a code, so give it a single 0 bit.
-            code_bits[c][0] = 0;
-            code_len[c] = 1;
+            set_bit(a_table->codes[c], 0, 0);
+            a_table->lengths[c] = 1;
         }
         else {
-            memcpy(code_bits[c], path, depth);
-            code_len[c] = depth;
+            memcpy(a_table->codes[c], code, (size_t)(depth + 7) / 8);
+            a_table->lengths[c] = (uint16_t)depth;
         }
         return;
     }
 
-    path[depth] = 0;
-    build_codes(root->left, path, depth + 1);
-    path[depth] = 1;
-    build_codes(root->right, path, depth + 1);
+    set_bit(code, depth, 0);
+    build_codes(node->left, a_table, code, depth + 1);
+    set_bit(code, depth, 1);
+    build_codes(node->right, a_table, code, depth + 1);
+}
+
+void build_code_table(CodeTable *a_table, TreeNode *root) {
+    memset(a_table, 0, sizeof(*a_table));
+    if (root == NULL) return;
+
+    uint8_t code[32] = {0};
+    build_codes(root, a_table, code, 0);
 }
 
 void write_compressed(BitWriter *a_writer, const uint8_t *uncompressed_bytes, uint64_t len,
                       TreeNode *root) {
     if (root == NULL) return;
 
-    uint8_t path[256];
-    memset(code_len, 0, sizeof(code_len));
-    build_codes(root, path, 0);
+    CodeTable table;
+    build_code_table(&table, root);
 
     for (uint64_t i = 0; i < len; i++) {
-        const uint8_t *bits = code_bits[uncompressed_bytes[i]];
-        int code = code_len[uncompressed_bytes[i]];
-
-        // write_bits takes at most 8 bits at a time.
-        for (int written = 0; written < code; ) {
-            int chunk = code - written > 8 ? 8 : code - written;
-            uint8_t byte = 0;
-            for (int j = 0; j < chunk; j++) {
-                byte = (uint8_t)((byte << 1) | bits[written + j]);
-            }
-            write_bits(a_writer, byte, (uint8_t)chunk);
-            written += chunk;
+        const uint8_t *code = table.codes[uncompressed_bytes[i]];
+        int nbits = table.lengths[uncompressed_bytes[i]];
+        for (int b = 0; b < nbits; b++) {
+            write_bits(a_writer, (uint8_t)get_bit(code, b), 1);
         }
     }
 }

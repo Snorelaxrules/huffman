@@ -83,6 +83,23 @@ void write_coding_table(TreeNode *root, BitWriter *a_writer);
 TreeNode *read_coding_table(BitReader *a_reader, uint16_t nsymbols);
 
 /**
+ * A symbol's code as a packed, MSB-first bit string. A Huffman code over 256
+ * symbols is at most 255 bits, so 32 bytes always suffices.
+ */
+typedef struct _CodeTable
+{
+  uint8_t codes[256][32];
+  uint16_t lengths[256];
+} CodeTable;
+
+/**
+ * @brief Fill `a_table` with the code for every character in `root`.
+ *
+ * Characters absent from the tree are left with length 0.
+ */
+void build_code_table(CodeTable *a_table, TreeNode *root);
+
+/**
  * @brief Compress `len` bytes of `uncompressed_bytes` using `root`.
  */
 void write_compressed(BitWriter *a_writer, const uint8_t *uncompressed_bytes, uint64_t len,
