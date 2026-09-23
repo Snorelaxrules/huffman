@@ -111,14 +111,14 @@ TreeNode *read_coding_table(BitReader *a_reader, uint16_t nsymbols) {
     PQNode *stack = NULL;
     uint16_t leaves = 0;
     while (leaves < nsymbols || stack == NULL || stack->next != NULL) {
-        uint8_t bit;
+        uint64_t bit;
         if (!read_bits(a_reader, 1, &bit)) goto fail;
 
         if (bit == 1) {
-            uint8_t character;
+            uint64_t character;
             if (leaves == nsymbols) goto fail;
             if (!read_bits(a_reader, 8, &character)) goto fail;
-            stack_push(&stack, new_node(character, 0, NULL, NULL));
+            stack_push(&stack, new_node((uchar)character, 0, NULL, NULL));
             leaves++;
         }
         else {
@@ -196,8 +196,22 @@ void write_compressed(BitWriter *a_writer, const uint8_t *uncompressed_bytes, ui
     for (uint64_t i = 0; i < len; i++) {
         const uint8_t *code = table.codes[uncompressed_bytes[i]];
         int nbits = table.lengths[uncompressed_bytes[i]];
-        for (int b = 0; b < nbits; b++) {
-            write_bits(a_writer, (uint8_t)get_bit(code, b), 1);
+
+        if (nbits <= BIT_MAX_RUN) {
+            // Assemble the code from whole bytes and shift off the bits past
+            // its length, so the common case is one write_bits call.
+            int nbytes = (nbits + 7) / 8;
+            uint64_t bits = 0;
+            for (int b = 0; b < nbytes; b++) {
+                bits = (bits << 8) | code[b];
+            }
+            write_bits(a_writer, bits >> (nbytes * 8 - nbits), nbits);
+        }
+        else {
+            // Only reachable for pathological frequency distributions.
+            for (int b = 0; b < nbits; b++) {
+                write_bits(a_writer, (uint64_t)get_bit(code, b), 1);
+            }
         }
     }
 }
@@ -208,7 +222,7 @@ bool read_compressed(BitReader *a_reader, FILE *file, TreeNode *root, uint64_t l
     for (uint64_t i = 0; i < len; i++) {
         TreeNode *node = root;
         while (!is_leaf(node)) {
-            uint8_t bit;
+            uint64_t bit;
             if (!read_bits(a_reader, 1, &bit)) return false;
             node = bit ? node->right : node->left;
             if (node == NULL) return false;
@@ -216,10 +230,7 @@ bool read_compressed(BitReader *a_reader, FILE *file, TreeNode *root, uint64_t l
 
         // A one-leaf tree encodes each byte as a single bit that carries no
         // information, so consume it here rather than walking for it above.
-        if (node == root) {
-            uint8_t bit;
-            if (!read_bits(a_reader, 1, &bit)) return false;
-        }
+        if (node == root && !consume_bits(a_reader, 1)) return false;
 
         fputc(node->character, file);
     }
@@ -300,8 +311,14 @@ bool huffman_compress(const char *in_path, const char *out_path, const char **a_
         bit_writer_init(&writer, out);
         write_coding_table(root, &writer);
         write_compressed(&writer, bytes, length, root);
-        bit_writer_flush(&writer);
+        bool flushed = bit_writer_flush(&writer);
         destroy_huffman_tree(&root);
+        if (!flushed) {
+            *a_error = "failed to write compressed data";
+            free(bytes);
+            fclose(out);
+            return false;
+        }
     }
 
     free(bytes);
