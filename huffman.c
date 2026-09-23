@@ -78,161 +78,144 @@ static bool is_leaf(const TreeNode *node) {
     return node->left == NULL && node->right == NULL;
 }
 
-void write_coding_table(TreeNode *root, BitWriter *a_writer) {
-    if (root == NULL) return;
-
-    if (is_leaf(root)) {
-        write_bits(a_writer, 1, 1);
-        write_bits(a_writer, root->character, 8);
-    }
-    else {
-        write_coding_table(root->left, a_writer);
-        write_coding_table(root->right, a_writer);
-        write_bits(a_writer, 0, 1);
-    }
-}
-
-// Frees a stack of partially built subtrees left behind by a failed read.
-static void destroy_node_stack(PQNode **a_stack) {
-    while (*a_stack != NULL) {
-        PQNode *node = stack_pop(a_stack);
-        TreeNode *subtree = node->a_value;
-        destroy_huffman_tree(&subtree);
-        free(node);
-    }
-}
-
-TreeNode *read_coding_table(BitReader *a_reader, uint16_t nsymbols) {
-    if (nsymbols == 0) return NULL;
-
-    // The table is post-order, so it replays as a stack machine: leaves are
-    // pushed, and a 0 pops the two subtrees it joins. It is complete once every
-    // declared leaf has been seen and the stack has collapsed to a single root.
-    PQNode *stack = NULL;
-    uint16_t leaves = 0;
-    while (leaves < nsymbols || stack == NULL || stack->next != NULL) {
-        uint64_t bit;
-        if (!read_bits(a_reader, 1, &bit)) goto fail;
-
-        if (bit == 1) {
-            uint64_t character;
-            if (leaves == nsymbols) goto fail;
-            if (!read_bits(a_reader, 8, &character)) goto fail;
-            stack_push(&stack, new_node((uchar)character, 0, NULL, NULL));
-            leaves++;
-        }
-        else {
-            // The right subtree was written second, so it pops first.
-            PQNode *right = stack_pop(&stack);
-            PQNode *left = stack_pop(&stack);
-            if (right == NULL || left == NULL) {
-                free(right);
-                free(left);
-                goto fail;
-            }
-            stack_push(&stack, new_node('\0', 0, left->a_value, right->a_value));
-            free(right);
-            free(left);
-        }
-    }
-
-    PQNode *top = stack_pop(&stack);
-    TreeNode *root = top->a_value;
-    free(top);
-    return root;
-
-fail:
-    destroy_node_stack(&stack);
-    return NULL;
-}
-
-// Sets or clears the bit at `index` in a packed MSB-first bit string.
-static void set_bit(uint8_t *code, int index, int value) {
-    uint8_t mask = (uint8_t)(1 << (7 - (index & 7)));
-    if (value) code[index >> 3] |= mask;
-    else code[index >> 3] &= (uint8_t)~mask;
-}
-
-static int get_bit(const uint8_t *code, int index) {
-    return (code[index >> 3] >> (7 - (index & 7))) & 1;
-}
-
-static void build_codes(TreeNode *node, CodeTable *a_table, uint8_t *code, int depth) {
+static void collect_lengths(const TreeNode *node, uint8_t lengths[256], int depth) {
     if (is_leaf(node)) {
-        uchar c = node->character;
-        if (depth == 0) {
-            // A tree of one leaf still needs a code, so give it a single 0 bit.
-            set_bit(a_table->codes[c], 0, 0);
-            a_table->lengths[c] = 1;
-        }
-        else {
-            memcpy(a_table->codes[c], code, (size_t)(depth + 7) / 8);
-            a_table->lengths[c] = (uint16_t)depth;
-        }
+        // A tree of one leaf has depth 0, but its symbol still needs a bit.
+        lengths[node->character] = (uint8_t)(depth > 0 ? depth : 1);
         return;
     }
 
-    set_bit(code, depth, 0);
-    build_codes(node->left, a_table, code, depth + 1);
-    set_bit(code, depth, 1);
-    build_codes(node->right, a_table, code, depth + 1);
+    collect_lengths(node->left, lengths, depth + 1);
+    collect_lengths(node->right, lengths, depth + 1);
 }
 
-void build_code_table(CodeTable *a_table, TreeNode *root) {
-    memset(a_table, 0, sizeof(*a_table));
+void get_code_lengths(TreeNode *root, uint8_t lengths[256]) {
     if (root == NULL) return;
-
-    uint8_t code[32] = {0};
-    build_codes(root, a_table, code, 0);
+    collect_lengths(root, lengths, 0);
 }
 
-void write_compressed(BitWriter *a_writer, const uint8_t *uncompressed_bytes, uint64_t len,
-                      TreeNode *root) {
-    if (root == NULL) return;
+void limit_code_lengths(uint8_t lengths[256]) {
+    // Kraft's inequality in fixed point: a code of length L claims
+    // 2^(MAX_CODE_LENGTH - L) of the 2^MAX_CODE_LENGTH available windows, and a
+    // valid prefix code claims no more than all of them.
+    const uint32_t capacity = UINT32_C(1) << MAX_CODE_LENGTH;
+    uint32_t claimed = 0;
+    for (int i = 0; i < 256; i++) {
+        if (lengths[i] == 0) continue;
+        if (lengths[i] > MAX_CODE_LENGTH) lengths[i] = MAX_CODE_LENGTH;
+        claimed += capacity >> lengths[i];
+    }
 
-    CodeTable table;
-    build_code_table(&table, root);
-
-    for (uint64_t i = 0; i < len; i++) {
-        const uint8_t *code = table.codes[uncompressed_bytes[i]];
-        int nbits = table.lengths[uncompressed_bytes[i]];
-
-        if (nbits <= BIT_MAX_RUN) {
-            // Assemble the code from whole bytes and shift off the bits past
-            // its length, so the common case is one write_bits call.
-            int nbytes = (nbits + 7) / 8;
-            uint64_t bits = 0;
-            for (int b = 0; b < nbytes; b++) {
-                bits = (bits << 8) | code[b];
-            }
-            write_bits(a_writer, bits >> (nbytes * 8 - nbits), nbits);
+    // Clamping overfilled the code space. Lengthening the deepest symbol that
+    // still has room frees the most space for the least compression lost.
+    while (claimed > capacity) {
+        int deepest = -1;
+        for (int i = 0; i < 256; i++) {
+            if (lengths[i] == 0 || lengths[i] >= MAX_CODE_LENGTH) continue;
+            if (deepest < 0 || lengths[i] > lengths[deepest]) deepest = i;
         }
-        else {
-            // Only reachable for pathological frequency distributions.
-            for (int b = 0; b < nbits; b++) {
-                write_bits(a_writer, (uint64_t)get_bit(code, b), 1);
-            }
-        }
+        if (deepest < 0) break; // every symbol is already at the cap
+
+        claimed -= capacity >> (lengths[deepest] + 1);
+        lengths[deepest]++;
     }
 }
 
-bool read_compressed(BitReader *a_reader, FILE *file, TreeNode *root, uint64_t len) {
-    if (root == NULL) return len == 0;
+void build_canonical_codes(CodeTable *a_table, const uint8_t lengths[256]) {
+    memset(a_table, 0, sizeof(*a_table));
 
-    for (uint64_t i = 0; i < len; i++) {
-        TreeNode *node = root;
-        while (!is_leaf(node)) {
-            uint64_t bit;
-            if (!read_bits(a_reader, 1, &bit)) return false;
-            node = bit ? node->right : node->left;
-            if (node == NULL) return false;
+    uint32_t code = 0;
+    for (int length = 1; length <= MAX_CODE_LENGTH; length++) {
+        for (int symbol = 0; symbol < 256; symbol++) {
+            if (lengths[symbol] != length) continue;
+            a_table->codes[symbol] = (uint16_t)code++;
+            a_table->lengths[symbol] = (uint8_t)length;
+        }
+        code <<= 1;
+    }
+}
+
+// Lengths are 4 bits each; a zero is followed by a count of further zeros, so
+// the long unused stretches of a sparse alphabet cost 12 bits in total.
+#define LENGTH_RUN_MAX 255
+
+void write_code_lengths(BitWriter *a_writer, const uint8_t lengths[256]) {
+    for (int i = 0; i < 256; ) {
+        write_bits(a_writer, lengths[i], 4);
+        if (lengths[i] != 0) {
+            i++;
+            continue;
         }
 
-        // A one-leaf tree encodes each byte as a single bit that carries no
-        // information, so consume it here rather than walking for it above.
-        if (node == root && !consume_bits(a_reader, 1)) return false;
+        int run = 0;
+        while (i + 1 + run < 256 && lengths[i + 1 + run] == 0 && run < LENGTH_RUN_MAX) run++;
+        write_bits(a_writer, (uint64_t)run, 8);
+        i += 1 + run;
+    }
+}
 
-        fputc(node->character, file);
+bool read_code_lengths(BitReader *a_reader, uint8_t lengths[256]) {
+    memset(lengths, 0, 256);
+
+    for (int i = 0; i < 256; ) {
+        uint64_t length;
+        if (!read_bits(a_reader, 4, &length)) return false;
+        if (length != 0) {
+            lengths[i++] = (uint8_t)length;
+            continue;
+        }
+
+        uint64_t run;
+        if (!read_bits(a_reader, 8, &run)) return false;
+        i += 1 + (int)run;
+        if (i > 256) return false;
+    }
+    return true;
+}
+
+DecodeTable *decode_table_create(const uint8_t lengths[256]) {
+    CodeTable codes;
+    build_canonical_codes(&codes, lengths);
+
+    // calloc leaves unclaimed windows at length 0, which read_compressed reads
+    // as "no code matches" and reports as corrupt input.
+    DecodeTable *table = calloc(1, sizeof(DecodeTable));
+    if (table == NULL) return NULL;
+
+    for (int symbol = 0; symbol < 256; symbol++) {
+        int length = codes.lengths[symbol];
+        if (length == 0) continue;
+
+        uint32_t span = UINT32_C(1) << (MAX_CODE_LENGTH - length);
+        uint32_t start = (uint32_t)codes.codes[symbol] << (MAX_CODE_LENGTH - length);
+        for (uint32_t i = 0; i < span; i++) {
+            table->entries[start + i].symbol = (uint8_t)symbol;
+            table->entries[start + i].length = (uint8_t)length;
+        }
+    }
+    return table;
+}
+
+void decode_table_destroy(DecodeTable **a_table) {
+    if (a_table == NULL) return;
+    free(*a_table);
+    *a_table = NULL;
+}
+
+void write_compressed(BitWriter *a_writer, const uint8_t *uncompressed_bytes, uint64_t len,
+                      const CodeTable *table) {
+    for (uint64_t i = 0; i < len; i++) {
+        uchar c = uncompressed_bytes[i];
+        write_bits(a_writer, table->codes[c], table->lengths[c]);
+    }
+}
+
+bool read_compressed(BitReader *a_reader, FILE *file, const DecodeTable *table, uint64_t len) {
+    for (uint64_t i = 0; i < len; i++) {
+        DecodeEntry entry = table->entries[peek_bits(a_reader, MAX_CODE_LENGTH)];
+        if (entry.length == 0) return false;
+        if (!consume_bits(a_reader, entry.length)) return false;
+        fputc(entry.symbol, file);
     }
     return true;
 }
@@ -293,6 +276,17 @@ bool huffman_compress(const char *in_path, const char *out_path, const char **a_
         if (bytes == NULL) return false;
     }
 
+    // The tree exists only to produce code lengths; the canonical codes are
+    // derived from those, so it is discarded before anything is written.
+    uint8_t lengths[256] = {0};
+    TreeNode *root = make_huffman_tree(freqs);
+    get_code_lengths(root, lengths);
+    destroy_huffman_tree(&root);
+    limit_code_lengths(lengths);
+
+    CodeTable table;
+    build_canonical_codes(&table, lengths);
+
     FILE *out = fopen(out_path, "wb");
     if (out == NULL) {
         *a_error = strerror(errno);
@@ -305,24 +299,22 @@ bool huffman_compress(const char *in_path, const char *out_path, const char **a_
     write_be(out, nsymbols, 2);
     write_be(out, length, 8);
 
-    TreeNode *root = make_huffman_tree(freqs);
-    if (root != NULL) {
+    bool flushed = true;
+    if (nsymbols > 0) {
         BitWriter writer;
         bit_writer_init(&writer, out);
-        write_coding_table(root, &writer);
-        write_compressed(&writer, bytes, length, root);
-        bool flushed = bit_writer_flush(&writer);
-        destroy_huffman_tree(&root);
-        if (!flushed) {
-            *a_error = "failed to write compressed data";
-            free(bytes);
-            fclose(out);
-            return false;
-        }
+        write_code_lengths(&writer, lengths);
+        write_compressed(&writer, bytes, length, &table);
+        flushed = bit_writer_flush(&writer);
     }
 
     free(bytes);
 
+    if (!flushed) {
+        *a_error = "failed to write compressed data";
+        fclose(out);
+        return false;
+    }
     if (fclose(out) != 0) {
         *a_error = strerror(errno);
         return false;
@@ -368,15 +360,20 @@ bool huffman_decompress(const char *in_path, const char *out_path, const char **
         BitReader reader;
         bit_reader_init(&reader, in);
 
-        TreeNode *root = read_coding_table(&reader, (uint16_t)nsymbols);
-        if (root == NULL) {
-            *a_error = "corrupt coding table";
+        uint8_t lengths[256];
+        DecodeTable *table = NULL;
+        if (!read_code_lengths(&reader, lengths)) {
+            *a_error = "corrupt code lengths";
+            ok = false;
+        }
+        else if ((table = decode_table_create(lengths)) == NULL) {
+            *a_error = "out of memory";
             ok = false;
         }
         else {
-            ok = read_compressed(&reader, out, root, length);
-            if (!ok) *a_error = "truncated compressed data";
-            destroy_huffman_tree(&root);
+            ok = read_compressed(&reader, out, table, length);
+            if (!ok) *a_error = "truncated or corrupt compressed data";
+            decode_table_destroy(&table);
         }
     }
     else if (length != 0) {

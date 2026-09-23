@@ -3,11 +3,12 @@ CFLAGS  = -std=c11 -Wall -Wextra -O2
 LDFLAGS =
 
 BIN     = huff
-SRCS    = main.c huffman.c priorityqueue.c bitwriter.c
+LIBSRCS = huffman.c priorityqueue.c bitwriter.c
+SRCS    = main.c $(LIBSRCS)
 OBJS    = $(SRCS:.c=.o)
 DEPS    = huffman.h priority_queue.h bitwriter.h
 
-.PHONY: all debug check clean
+.PHONY: all debug check test clean
 
 all: $(BIN)
 
@@ -30,5 +31,10 @@ check: $(BIN)
 	done
 	@rm -f /tmp/huff-check.huf /tmp/huff-check.out
 
+# Round-trip and edge-case tests. Always built with sanitizers.
+test: test.c $(LIBSRCS) $(DEPS)
+	$(CC) -std=c11 -Wall -Wextra -g -fsanitize=address,undefined -o huff-test test.c $(LIBSRCS)
+	./huff-test
+
 clean:
-	rm -f $(BIN) $(OBJS)
+	rm -f $(BIN) $(OBJS) huff-test
