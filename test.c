@@ -1,5 +1,11 @@
 // Round-trip and edge-case tests. Build with `make test`.
+#include "archive.h"
 #include "huffman.h"
+#include "lz77.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define TMP_IN "/tmp/huff-test.in"
 #define TMP_HUF "/tmp/huff-test.huf"
@@ -58,7 +64,7 @@ static void roundtrip(const char *name, const uint8_t *data, size_t len) {
 // Fibonacci frequencies are the worst case for code length: each symbol sits
 // one level deeper than the last, so this forces limit_code_lengths to act.
 static void test_length_limiting(void) {
-    Frequencies freqs = {0};
+    uint64_t freqs[LZ_LITLEN_SYMBOLS] = {0};
     uint64_t a = 1, b = 1;
     for (int i = 0; i < 24; i++) {
         freqs[i] = a;
@@ -67,20 +73,20 @@ static void test_length_limiting(void) {
         b = next;
     }
 
-    uint8_t lengths[256] = {0};
-    TreeNode *root = make_huffman_tree(freqs);
+    uint8_t lengths[LZ_LITLEN_SYMBOLS] = {0};
+    TreeNode *root = make_huffman_tree(freqs, LZ_LITLEN_SYMBOLS);
     get_code_lengths(root, lengths);
     destroy_huffman_tree(&root);
 
     int unlimited = 0;
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < LZ_LITLEN_SYMBOLS; i++)
         if (lengths[i] > unlimited) unlimited = lengths[i];
 
-    limit_code_lengths(lengths);
+    limit_code_lengths(lengths, LZ_LITLEN_SYMBOLS);
 
     int limited = 0;
     uint32_t claimed = 0;
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < LZ_LITLEN_SYMBOLS; i++) {
         if (lengths[i] == 0) continue;
         if (lengths[i] > limited) limited = lengths[i];
         claimed += (UINT32_C(1) << MAX_CODE_LENGTH) >> lengths[i];
@@ -93,12 +99,39 @@ static void test_length_limiting(void) {
               claimed <= (UINT32_C(1) << MAX_CODE_LENGTH),
           "length limiting", detail);
 
-    // And the limited code must still round-trip real data.
     size_t len = 0;
     static uint8_t data[200000];
     for (int i = 0; i < 24 && len < sizeof data; i++)
         for (uint64_t j = 0; j < freqs[i] && len < sizeof data; j++) data[len++] = (uint8_t)i;
     roundtrip("fibonacci corpus", data, len);
+}
+
+// Every distinct match shape LZ77 can emit needs to survive a round trip.
+static void test_lz77_shapes(void) {
+    // Overlapping copy: distance 1, length far greater, the run-length case.
+    static uint8_t run[100000];
+    memset(run, 'q', sizeof run);
+    roundtrip("overlapping run", run, sizeof run);
+
+    // A match at the longest distance the window allows.
+    static uint8_t far[LZ_WINDOW_SIZE + 64];
+    srand(11);
+    for (size_t i = 0; i < sizeof far; i++) far[i] = (uint8_t)(rand() % 251 + 1);
+    memcpy(far + sizeof far - 32, far, 32);
+    roundtrip("match at window edge", far, sizeof far);
+
+    // A match longer than LZ_MAX_MATCH, which must split into several tokens.
+    static uint8_t longrep[4096];
+    for (size_t i = 0; i < sizeof longrep; i++) longrep[i] = (uint8_t)(i % 7);
+    roundtrip("match beyond max len", longrep, sizeof longrep);
+
+    // Matches of exactly the minimum length, and just under it.
+    roundtrip("min length matches", (const uint8_t *)"abcXabcYabYZabc", 15);
+
+    // Data with no matches at all, so the distance alphabet stays empty.
+    uint8_t distinct[200];
+    for (int i = 0; i < 200; i++) distinct[i] = (uint8_t)i;
+    roundtrip("no matches at all", distinct, sizeof distinct);
 }
 
 static void test_rejects(const char *name, const uint8_t *data, size_t len, const char *want) {
@@ -135,11 +168,12 @@ int main(void) {
     roundtrip("english-ish text 400k", text, sizeof text);
 
     test_length_limiting();
+    test_lz77_shapes();
 
     test_rejects("rejects foreign file", (const uint8_t *)"NOPE12345678901", 15, "not a huffman");
-    test_rejects("rejects short header", (const uint8_t *)"HUFF\x02\x00", 6, "truncated header");
+    test_rejects("rejects short header", (const uint8_t *)"HUFF\x03\x00", 6, "truncated header");
 
-    uint8_t wrong_version[HUFFMAN_HEADER_LEN] = {'H', 'U', 'F', 'F', 1};
+    uint8_t wrong_version[ARCHIVE_HEADER_LEN] = {'H', 'U', 'F', 'F', 2};
     test_rejects("rejects old version", wrong_version, sizeof wrong_version, "unsupported");
 
     // Truncate a real archive partway through its compressed data.

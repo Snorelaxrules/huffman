@@ -1,4 +1,8 @@
-#include "huffman.h"
+#include "archive.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define DEFAULT_SUFFIX ".huf"
 

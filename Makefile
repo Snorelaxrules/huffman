@@ -3,10 +3,10 @@ CFLAGS  = -std=c11 -Wall -Wextra -O2
 LDFLAGS =
 
 BIN     = huff
-LIBSRCS = huffman.c priorityqueue.c bitwriter.c
+LIBSRCS = archive.c huffman.c lz77.c priorityqueue.c bitwriter.c
 SRCS    = main.c $(LIBSRCS)
 OBJS    = $(SRCS:.c=.o)
-DEPS    = huffman.h priority_queue.h bitwriter.h
+DEPS    = archive.h huffman.h lz77.h priority_queue.h bitwriter.h
 
 .PHONY: all debug check test clean
 
